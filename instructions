@@ -1,0 +1,166 @@
+Event-Driven data loading from Amazon S3 into Snowflake: 
+
+The Architecture Flow - 
+    1) A file is uploaded to Amazon S3.
+    2) S3 triggers an Object Created event notification.
+    3) This notification is sent to an Amazon SQS queue managed automatically by Snowflake.
+    4) Snowpipe responds to the SQS message, grabs the file, and loads it into the Snowflake Table.
+
+Step 1 : Set the role to accountadmin, create the database snowpipe_dev and create the table orders_data_lz (target table). 
+
+Step 2 : Create the S3 bucket. 
+
+Step 3 : Create storage Integration. 
+         Format :
+            CREATE [ OR REPLACE ] STORAGE INTEGRATION [IF NOT EXISTS]
+            <name>
+            TYPE = { EXTERNAL_STAGE | POSTGRES_EXTERNAL_STORAGE | POSTGRES_INTERNAL_STORAGE }
+            cloudProviderParams ---------> Description Below <------------------
+            ENABLED = { TRUE | FALSE }
+            STORAGE_ALLOWED_LOCATIONS = ('<cloud>://<bucket>/<path>/' [ , '<cloud>://<bucket>/<path>/' ... ] )
+            [ STORAGE_BLOCKED_LOCATIONS = ('<cloud>://<bucket>/<path>/' [ , '<cloud>://<bucket>/<path>/' ... ] ) ]
+            [ COMMENT = '<string_literal>' ]
+
+            cloudProviderParams (for Amazon S3) ::=
+            STORAGE_PROVIDER = 'S3'
+            STORAGE_AWS_ROLE_ARN = '<iam_role>'
+            [ STORAGE_AWS_EXTERNAL_ID = '<external_id>' ]
+            [ STORAGE_AWS_OBJECT_ACL = 'bucket-owner-full-control' ]
+            [ USE_PRIVATELINK_ENDPOINT = { TRUE | FALSE } ]
+
+         SQL Code : 
+            CREATE OR REPLACE STORAGE INTEGRATION s3_integration
+            TYPE = EXTERNAL_STAGE
+            STORAGE_PROVIDER = 'S3'
+            ENABLED = TRUE
+            STORAGE_ALLOWED_LOCATIONS = ('s3://rootshailesh1/snowpipe_project/')
+            STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::123456789012:role/your_snowflake_role';
+
+Step 4 : Create SnowflakeS3ReadPolicy 
+         JSON :
+        {
+        "Version": "2012-10-17",
+        "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:GetObjectVersion",
+                "s3:PutObject",
+                "s3:DeleteObject" ],
+            "Resource": "arn:aws:s3:::rootshailesh1/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+            ],
+            "Resource": "arn:aws:s3:::rootshailesh1"
+        } ] }
+
+Step 5 : Create Snowflake_Storage_Integration_Role 
+         1) In the IAM Console, go to Roles -> Create Role.  
+         2) Select AWS Account as the trusted entity type, and choose Another AWS Account.  
+         3) For now, enter your own AWS Account ID as a temporary placeholder.  
+         4) Check the box for Require external ID and enter a temporary placeholder value like 0000. (We will replace both of these in Part 3).
+         5) Click Next, search for your SnowflakeS3ReadPolicy, check the box to attach it, and click Next.Name the role something clear, like Snowflake_Storage_Integration_Role.
+         6) Click Create Role.Copy the ARN of this new role (it will look like arn:aws:iam::123456789012:role/Snowflake_Storage_Integration_Role). 
+            This is the exact string you paste into your Snowflake CREATE STORAGE INTEGRATION command for the STORAGE_AWS_ROLE_ARN parameter.
+
+Step 6 : In snowflake run - DESC INTEGRATION s3_integration;
+
+Step 7 : Go back to the role and update the trusted relationship tab 
+         {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                "Sid": "AllowSnowflakeToAssume",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": "PASTE_YOUR_STORAGE_AWS_IAM_USER_ARN_HERE". ----> Get this from Step 6
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "StringEquals": {
+                    "sts:ExternalId": "PASTE_YOUR_STORAGE_AWS_EXTERNAL_ID_HERE". ----> Get this from Step 6
+                    }
+                }
+                }
+            ]
+        }
+
+Step 8 : Storage Integration - A Storage Integration in Snowflake is a secure, named object that allows Snowflake to connect to external cloud storage
+         SQL : 
+            CREATE OR REPLACE STORAGE INTEGRATION s3_integration
+            TYPE = EXTERNAL_STAGE
+            STORAGE_PROVIDER = 'S3'
+            ENABLED = TRUE
+            STORAGE_ALLOWED_LOCATIONS = ('s3://rootshailesh1/snowpipe_project/')  -- This is in the bucket level
+            STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::060662064877:role/Snowflake_Storage_Integration_Role';
+                
+Step 9 : Create a Stage - A stage in Snowflake refers to a location (internal or external) where data files are uploaded, stored, and prepared 
+                          before being loaded into Snowflake tables.
+         SQL : 
+         CREATE OR REPLACE STAGE snowpipe_stage
+         url = 's3://rootshailesh1/snowpipe_project/snowpipe_project/'  -- This is at folder level
+         storage_integration = s3_integration;
+
+Step 10 : Create the snow pipe - Snowpipe is Snowflake's continuous, serverless data ingestion service. 
+                                 It allows you to load data from micro-batches of files as soon as they become 
+                                 available in a cloud storage stage, making the data queryable in minutes without 
+                                 requiring manual execution of COPY commands.
+          SQL :
+          CREATE OR REPLACE PIPE my_event_pipe
+          AUTO_INGEST = TRUE AS
+          COPY INTO orders_data_lz
+          FROM @snowpipe_stage; 
+
+Step 11 : Run SHOW PIPES;
+          Look for the column named notification_channel. It will contain an ARN that looks something like this: arn:aws:sqs:us-east-1:123456789012:sf-snowpipe-XXXXXXXXXX
+          Copy this value.
+
+          To make the "Auto Ingest" part actually work, you need to tell your S3 bucket to send a message to Snowflake every time a new file is dropped into your folder.
+          Go to your AWS Console and navigate to your S3 bucket (rootshailesh1).
+          Click on the Properties tab. Scroll down to the Event notifications section and click Create event notification.
+          Configure the following:
+              Event name: Snowpipe-Ingest (or any name you prefer)
+              Prefix: snowpipe_project/ (This ensures it only triggers for files inside your specific folder)
+              Event types: Check the box for All object create events (s3:ObjectCreated:*).
+              Destination: Select SQS queue.
+              Specify SQS queue: Choose Enter SQS queue ARN and paste the notification_channel ARN you copied from Snowflake. Click Save changes.
+
+Step 12 : Once AWS is configured, your pipeline is fully automated. To test it:
+                Upload a new CSV file to s3://rootshailesh1/snowpipe_project/snowpipe_project/.
+                Wait about 30 to 60 seconds. Run a query in Snowflake to see if the data arrived:
+          SQL : SELECT * FROM orders_data_lz;
+          
+
+
+What the heck is going on? 
+
+To understand exactly what is happening, the biggest mental shift to make is this: There are two completely separate AWS accounts involved here.
+Your Personal AWS Account: This is the account where you created your S3 bucket and your IAM role.
+Snowflake’s AWS Account: When you spun up your Snowflake free trial, Snowflake provisioned infrastructure for you inside their massive corporate AWS account.
+Here is exactly what is happening behind the scenes for both the SQS Queue and the IAM Trust Relationship.
+
+1. The Snowpipe SQS Setup (The Notification Link)
+When you ran CREATE PIPE ... AUTO_INGEST = TRUE, Snowflake automatically went into its own AWS account and created a dedicated SQS (Simple Queue Service) queue just for your pipe.
+Why did they create it? Snowflake needs a mailbox where it can receive alerts whenever a new file drops into your S3 bucket.
+Why are you copying the ARN? Because that SQS queue lives in Snowflake's AWS account, your personal S3 bucket has no idea it exists. By pasting that SQS ARN into your S3 Event Notifications, you are telling your personal S3 bucket: "Hey, whenever a new CSV file lands here, send a ping to this specific mailbox over in Snowflake's AWS account."
+
+2. The IAM Trust Relationship (The Security Link)
+The exact same "two-account" logic applies to your STORAGE INTEGRATION and the IAM role.
+When you ran DESC INTEGRATION s3_integration;, Snowflake gave you two important values:
+STORAGE_AWS_IAM_USER_ARN (An IAM user starting with something like arn:aws:iam::123456789012:user/...)
+STORAGE_AWS_EXTERNAL_ID
+That IAM User ARN belongs to a virtual user living inside Snowflake’s AWS account, not yours.
+What is happening? Snowflake needs permission to step inside your personal S3 bucket to grab your data files. However, for security reasons, you cannot just give Snowflake your master AWS password.
+The Solution: You created an IAM Role (Snowflake_Storage_Integration_Role) in your personal account. In the Trust Relationship policy of that role, you explicitly wrote: "I trust the Snowflake IAM User ARN, and I will only let them in if they provide the correct External ID."
+
+Putting It All Together (The Complete Handshake)
+When a file is processed, the loop looks like this:
+You drop a file into your S3 bucket. Your S3 bucket sends a message to Snowflake's SQS queue (using the ARN you pasted).
+Snowflake wakes up and says, "Ah, a new file is ready!" Snowflake's automated worker assumes your IAM Role using the cross-account trust relationship you configured.
+Snowflake safely reads the file from your S3 bucket and loads it into your orders_data_lz table.
+
